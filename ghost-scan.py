@@ -19,7 +19,7 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 
-VERSAO = "1.0.0"
+VERSAO = "1.1.0"
 
 # ──────────────────────────────────────────────────────────────────
 # BANNER
@@ -445,6 +445,180 @@ def exportar_nmap_xml(host, portas_abertas, udp_resultados, os_info, caminho):
 
 
 # ──────────────────────────────────────────────────────────────────
+# HTTP FINGERPRINT
+# ──────────────────────────────────────────────────────────────────
+
+def http_fingerprint(host, porta, timeout=5, ssl_ctx=None):
+    """Captura titulo, Server header e tecnologias de uma porta web."""
+    esquema = "https" if (porta in (443, 8443, 4443) or ssl_ctx) else "http"
+    url = f"{esquema}://{host}:{porta}/"
+    import urllib.request, urllib.error, ssl as _ssl
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+    req = urllib.request.Request(url, headers={"User-Agent": "GhostScan/1.1"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+            headers = dict(r.headers)
+            body = r.read(4096).decode("utf-8", errors="ignore")
+    except urllib.error.HTTPError as e:
+        headers = dict(e.headers) if e.headers else {}
+        body = ""
+    except Exception:
+        return None
+
+    # Titulo
+    titulo = ""
+    import re as _re
+    m = _re.search(r"<title[^>]*>([^<]{0,120})</title>", body, _re.I)
+    if m:
+        titulo = m.group(1).strip()
+
+    # Tecnologias
+    techs = []
+    server = headers.get("server") or headers.get("Server", "")
+    powered = headers.get("x-powered-by") or headers.get("X-Powered-By", "")
+    if server:
+        techs.append(f"Server: {server}")
+    if powered:
+        techs.append(f"X-Powered-By: {powered}")
+    # Framework hints no body/headers
+    for sig, nome in [("wp-content", "WordPress"), ("Joomla", "Joomla"),
+                      ("drupal", "Drupal"), ("Laravel", "Laravel"),
+                      ("React", "React"), ("Angular", "Angular"),
+                      ("jquery", "jQuery"), ("bootstrap", "Bootstrap"),
+                      ("phpMyAdmin", "phpMyAdmin"), ("jenkins", "Jenkins"),
+                      ("Tomcat", "Tomcat"), ("grafana", "Grafana")]:
+        if sig.lower() in body.lower():
+            techs.append(nome)
+
+    return {"url": url, "titulo": titulo, "server": server, "techs": techs,
+            "status": headers.get("status", ""), "x-powered-by": powered}
+
+
+def fingerprint_portas_web(host, portas_abertas, timeout=5, verbose=False):
+    """Roda HTTP fingerprint em todas as portas web abertas."""
+    portas_web = {80, 443, 8080, 8443, 8008, 8888, 3000, 4000, 5000, 9000, 9090, 9200}
+    resultados = {}
+    for p_info in portas_abertas:
+        porta = p_info["porta"] if isinstance(p_info, dict) else p_info
+        if porta in portas_web:
+            fp = http_fingerprint(host, porta, timeout=timeout)
+            if fp:
+                resultados[porta] = fp
+                nivel = "OK"
+                titulo_str = f" | {fp['titulo']}" if fp["titulo"] else ""
+                server_str = f" | {fp['server']}" if fp["server"] else ""
+                techs_str = f" | {', '.join(fp['techs'])}" if fp["techs"] else ""
+                _log(f"HTTP:{porta}{titulo_str}{server_str}{techs_str}", nivel)
+            elif verbose:
+                _log(f"HTTP:{porta} sem resposta", "INFO")
+    return resultados
+
+
+# ──────────────────────────────────────────────────────────────────
+# SSL/TLS ANALYSIS
+# ──────────────────────────────────────────────────────────────────
+
+def analisar_ssl(host, porta=443, timeout=5):
+    """Analisa certificado SSL/TLS e cipher suite de uma porta."""
+    import ssl as _ssl
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+    try:
+        conn = _ssl.SSLSocket
+        with _ssl.wrap_socket(socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET),
+                               server_hostname=host, ssl_version=_ssl.PROTOCOL_TLS_CLIENT if hasattr(_ssl, 'PROTOCOL_TLS_CLIENT') else _ssl.PROTOCOL_SSLv23) as s:
+            s.settimeout(timeout)
+            s.connect((host, porta))
+            cipher = s.cipher()
+            cert = s.getpeercert()
+    except Exception:
+        # Fallback sem SNI
+        try:
+            ctx2 = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT if hasattr(_ssl, 'PROTOCOL_TLS_CLIENT') else _ssl.PROTOCOL_SSLv23)
+            ctx2.check_hostname = False
+            ctx2.verify_mode = _ssl.CERT_NONE
+            with ctx2.wrap_socket(socket.socket(), server_hostname=host) as s:
+                s.settimeout(timeout)
+                s.connect((host, porta))
+                cipher = s.cipher()
+                cert = s.getpeercert()
+        except Exception as e:
+            return {"erro": str(e)}
+
+    resultado = {
+        "porta": porta,
+        "cipher_name": cipher[0] if cipher else "desconhecido",
+        "protocol": cipher[1] if cipher else "desconhecido",
+        "bits": cipher[2] if cipher else 0,
+    }
+
+    if cert:
+        subject = dict(x[0] for x in cert.get("subject", []))
+        issuer  = dict(x[0] for x in cert.get("issuer", []))
+        resultado["cn"] = subject.get("commonName", "")
+        resultado["issuer"] = issuer.get("organizationName", "")
+        resultado["not_before"] = cert.get("notBefore", "")
+        resultado["not_after"]  = cert.get("notAfter", "")
+        resultado["sans"] = [v for _, v in cert.get("subjectAltName", [])]
+
+    # Flags de fraqueza
+    weak = []
+    if cipher and cipher[1] in ("SSLv2", "SSLv3", "TLSv1", "TLSv1.1"):
+        weak.append(f"Protocolo fraco: {cipher[1]}")
+    if cipher and cipher[2] and cipher[2] < 128:
+        weak.append(f"Chave fraca: {cipher[2]} bits")
+    if cipher and cipher[0] and any(w in cipher[0].upper() for w in ("RC4", "MD5", "DES", "NULL", "EXPORT")):
+        weak.append(f"Cipher inseguro: {cipher[0]}")
+    resultado["fraquezas"] = weak
+
+    return resultado
+
+
+def ssl_scan_portas(host, portas_abertas, timeout=5, verbose=False):
+    """Roda analise SSL nas portas 443/8443 abertas."""
+    portas_ssl = {443, 8443, 4443, 9443}
+    resultados = {}
+    for p_info in portas_abertas:
+        porta = p_info["porta"] if isinstance(p_info, dict) else p_info
+        if porta in portas_ssl:
+            r = analisar_ssl(host, porta, timeout=timeout)
+            resultados[porta] = r
+            if "erro" in r:
+                if verbose:
+                    _log(f"SSL:{porta} erro: {r['erro']}", "INFO")
+            else:
+                nivel = "ALERTA" if r.get("fraquezas") else "OK"
+                cn = r.get("cn", "")
+                proto = r.get("protocol", "")
+                bits = r.get("bits", 0)
+                fraq = " | FRACO: " + "; ".join(r["fraquezas"]) if r.get("fraquezas") else ""
+                _log(f"SSL:{porta} {proto} {bits}b CN={cn}{fraq}", nivel)
+                if r.get("sans") and verbose:
+                    _log(f"  SANs: {', '.join(r['sans'][:5])}", "INFO")
+                if r.get("not_after"):
+                    _log(f"  Expira: {r['not_after']}", "INFO")
+    return resultados
+
+
+# ──────────────────────────────────────────────────────────────────
+# IPv6 support helper
+# ──────────────────────────────────────────────────────────────────
+
+def resolver_ipv6(host, timeout=3):
+    """Resolve AAAA record e retorna primeiro IPv6 ou None."""
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_INET6, socket.SOCK_STREAM)
+        if infos:
+            return infos[0][4][0]
+    except Exception:
+        pass
+    return None
+
+
+# ──────────────────────────────────────────────────────────────────
 # Scan de host unico
 # ──────────────────────────────────────────────────────────────────
 
@@ -497,6 +671,29 @@ def scan_host(host, portas, args):
     if args.banner and portas_abertas:
         cves = correlacionar_cves(portas_abertas)
 
+    # HTTP fingerprint
+    http_fp = {}
+    if getattr(args, "http_fp", False) and portas_abertas:
+        _secao("HTTP FINGERPRINT")
+        http_fp = fingerprint_portas_web(ip, portas_abertas, timeout=args.timeout,
+                                         verbose=args.verbose)
+
+    # SSL/TLS analysis
+    ssl_info = {}
+    if getattr(args, "ssl", False) and portas_abertas:
+        _secao("SSL/TLS ANALYSIS")
+        ssl_info = ssl_scan_portas(ip, portas_abertas, timeout=args.timeout,
+                                   verbose=args.verbose)
+
+    # IPv6 resolve
+    ipv6_addr = None
+    if getattr(args, "ipv6", False):
+        ipv6_addr = resolver_ipv6(host, timeout=args.timeout)
+        if ipv6_addr:
+            _log(f"IPv6: {ipv6_addr}", "OK")
+        else:
+            _log("IPv6: sem resposta AAAA", "INFO")
+
     elapsed = time.time() - t_inicio
     _log(f"Scan concluido em {elapsed:.1f}s", "INFO")
 
@@ -507,6 +704,9 @@ def scan_host(host, portas, args):
         "portas_udp": udp_resultados,
         "os": os_info,
         "cves": cves,
+        "http_fingerprint": http_fp,
+        "ssl": ssl_info,
+        "ipv6": ipv6_addr,
         "duracao_s": round(elapsed, 2),
     }
 
@@ -542,10 +742,25 @@ def main():
                         help="Exportar em formato Nmap XML")
     parser.add_argument("--verbose", action="store_true",
                         help="Saida detalhada")
+    parser.add_argument("--http-fp", action="store_true", dest="http_fp",
+                        help="HTTP fingerprint: titulo, Server, tecnologias nas portas web")
+    parser.add_argument("--ssl", action="store_true",
+                        help="Analise SSL/TLS: cipher, protocolo, cert, fraquezas (portas 443/8443)")
+    parser.add_argument("--ipv6", action="store_true",
+                        help="Resolver registro AAAA (IPv6) do alvo alem do IPv4")
+    parser.add_argument("--fast", action="store_true",
+                        help="Modo rapido: timeout 0.3s, rate 2000, top100 portas, sem banner")
 
     args = parser.parse_args()
 
     print(BANNER)
+
+    # Fast mode overrides
+    if args.fast:
+        args.timeout = 0.3
+        args.rate = 2000
+        args.banner = False
+        _log("Modo rapido: timeout=0.3s rate=2000 banner=off", "INFO")
 
     # Parsear portas
     portas = PORTAS_TOP_100
