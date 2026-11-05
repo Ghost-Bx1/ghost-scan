@@ -18,8 +18,10 @@ import random
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
+import urllib.request
+import urllib.error
 
-VERSAO = "1.1.0"
+VERSAO = "2.0.0"
 
 # ──────────────────────────────────────────────────────────────────
 # BANNER
@@ -100,6 +102,16 @@ def _build_banner():
 
 
 BANNER = _build_banner()
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/121.0",
+    "curl/8.5.0",
+    "python-requests/2.31.0",
+    "GhostScan/2.0 (compatible; Recon)",
+]
+
+_PROXY = None
 
 C = {
     "R": "\033[91m", "G": "\033[92m", "Y": "\033[93m",
@@ -452,11 +464,18 @@ def http_fingerprint(host, porta, timeout=5, ssl_ctx=None):
     """Captura titulo, Server header e tecnologias de uma porta web."""
     esquema = "https" if (porta in (443, 8443, 4443) or ssl_ctx) else "http"
     url = f"{esquema}://{host}:{porta}/"
-    import urllib.request, urllib.error, ssl as _ssl
+    import ssl as _ssl
     ctx = _ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = _ssl.CERT_NONE
-    req = urllib.request.Request(url, headers={"User-Agent": "GhostScan/1.1"})
+    ua = random.choice(USER_AGENTS)
+    req = urllib.request.Request(url, headers={"User-Agent": ua})
+    if _PROXY:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": _PROXY, "https": _PROXY}),
+            urllib.request.HTTPSHandler(context=ctx)
+        )
+        urllib.request.install_opener(opener)
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
             headers = dict(r.headers)
@@ -712,6 +731,56 @@ def scan_host(host, portas, args):
 
 
 # ──────────────────────────────────────────────────────────────────
+# HTML Report
+# ──────────────────────────────────────────────────────────────────
+
+def gerar_html(resultados: list, output_path: str):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    linhas_hosts = ""
+    for r in resultados:
+        host = r.get("host", "?")
+        ip = r.get("ip", "?")
+        portas = r.get("portas_tcp", [])
+        cves = r.get("cves", [])
+        os_est = r.get("os", {}).get("os_estimado", "?")
+        rows = "".join(
+            f"<tr><td>{p['porta']}/tcp</td><td>{p.get('servico','?')}</td>"
+            f"<td style='color:#39d353'>open</td>"
+            f"<td style='font-size:11px;color:#8b949e'>{p.get('banner','')[:80]}</td></tr>"
+            for p in portas
+        )
+        cve_rows = "".join(
+            f"<tr><td style='color:#f85149'>{c['cve']}</td><td>{c['porta']}</td>"
+            f"<td>{c['score']}</td><td style='font-size:11px'>{c['descricao']}</td></tr>"
+            for c in cves
+        )
+        linhas_hosts += f"""
+<div class="host-box">
+  <h3>{host} ({ip}) &mdash; OS: {os_est} &mdash; {len(portas)} porta(s) TCP</h3>
+  <table><thead><tr><th>Porta</th><th>Servico</th><th>Estado</th><th>Banner</th></tr></thead>
+  <tbody>{rows or '<tr><td colspan=4>Sem portas abertas</td></tr>'}</tbody></table>
+  {'<h4 style="color:#f85149">CVEs Detectadas</h4><table><thead><tr><th>CVE</th><th>Porta</th><th>CVSS</th><th>Descricao</th></tr></thead><tbody>' + cve_rows + '</tbody></table>' if cve_rows else ''}
+</div>"""
+
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Ghost-Scan Report</title>
+<style>body{{background:#0d1117;color:#e6edf3;font-family:monospace;padding:20px;}}
+h1,h2{{color:#39d353;}} h3{{color:#58a6ff;}} h4{{color:#f0883e;}}
+table{{width:100%;border-collapse:collapse;margin:8px 0;}}
+th{{background:#161b22;padding:6px 10px;text-align:left;border-bottom:1px solid #30363d;color:#8b949e;}}
+td{{padding:5px 10px;border-bottom:1px solid #21262d;font-size:12px;}}
+.host-box{{background:#161b22;padding:15px;border-radius:6px;border-left:4px solid #58a6ff;margin:12px 0;}}
+</style></head><body>
+<h1>Ghost-Scan Report</h1>
+<p>By Gh0st-Bx1 | github.com/Ghost-Bx1 | {ts} | {len(resultados)} host(s)</p>
+{linhas_hosts}
+</body></html>"""
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    _log(f"Relatorio HTML: {output_path}", "OK")
+
+
+# ──────────────────────────────────────────────────────────────────
 # CLI / main
 # ──────────────────────────────────────────────────────────────────
 
@@ -722,8 +791,10 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter,
     )
 
-    parser.add_argument("-t", "--target", required=True,
+    parser.add_argument("-t", "--target", default=None,
                         help="Alvo: hostname, IP ou CIDR (ex: 192.168.1.0/24)")
+    parser.add_argument("--targets-file", metavar="FILE",
+                        help="Arquivo com alvos (um por linha)")
     parser.add_argument("-p", "--ports",
                         help="Portas: '80,443', '1-1024', 'top100', 'full' (padrao: top100)")
     parser.add_argument("--rate", type=int, default=1000,
@@ -750,10 +821,29 @@ def main():
                         help="Resolver registro AAAA (IPv6) do alvo alem do IPv4")
     parser.add_argument("--fast", action="store_true",
                         help="Modo rapido: timeout 0.3s, rate 2000, top100 portas, sem banner")
+    parser.add_argument("--threads", type=int, default=10,
+                        help="Threads para scan de multiplos hosts (padrao: 10)")
+    parser.add_argument("--proxy", metavar="URL",
+                        help="Proxy HTTP/HTTPS para requisicoes web (ex: http://127.0.0.1:8080)")
+    parser.add_argument("--html-output", metavar="FILE",
+                        help="Salvar relatorio HTML")
+    parser.add_argument("--no-banner", action="store_true",
+                        help="Sem banner inicial")
 
     args = parser.parse_args()
 
-    print(BANNER)
+    if not args.no_banner:
+        print(BANNER)
+
+    if not args.target and not args.targets_file:
+        _log("Use --target ou --targets-file", "ERRO")
+        parser.print_help()
+        sys.exit(1)
+
+    global _PROXY
+    if args.proxy:
+        _PROXY = args.proxy
+        _log(f"Proxy: {_PROXY}", "INFO")
 
     # Fast mode overrides
     if args.fast:
@@ -785,8 +875,27 @@ def main():
                 _log("Formato de portas invalido. Use: 80,443,8080", "ERRO")
                 sys.exit(1)
 
+    # Coletar alvos
+    alvos_raw = []
+    if args.target:
+        alvos_raw.append(args.target)
+    if args.targets_file:
+        try:
+            with open(args.targets_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        alvos_raw.append(line)
+        except Exception as e:
+            _log(f"Erro ao ler targets-file: {e}", "ERRO")
+            sys.exit(1)
+
     # Expandir CIDR
-    hosts = expandir_cidr(args.target)
+    hosts = []
+    for alvo in alvos_raw:
+        hosts.extend(expandir_cidr(alvo))
+
+    hosts = list(dict.fromkeys(hosts))  # deduplica mantendo ordem
     if not hosts:
         _log("Nenhum host para escanear", "ERRO")
         sys.exit(1)
@@ -798,10 +907,19 @@ def main():
         _log("UDP scan habilitado", "INFO")
 
     todos_resultados = []
-    for host in hosts:
-        r = scan_host(host, portas, args)
+    if len(hosts) == 1:
+        r = scan_host(hosts[0], portas, args)
         if r:
             todos_resultados.append(r)
+    else:
+        _log(f"Scan em massa: {len(hosts)} hosts, {args.threads} threads", "INFO")
+        with ThreadPoolExecutor(max_workers=args.threads) as pool:
+            futures = {pool.submit(scan_host, h, portas, args): h for h in hosts}
+            from concurrent.futures import as_completed
+            for fut in as_completed(futures):
+                r = fut.result()
+                if r:
+                    todos_resultados.append(r)
 
     # Resumo
     _secao("RESUMO FINAL")
@@ -833,6 +951,12 @@ def main():
                               args.nmap_xml)
         except Exception as e:
             _log(f"Erro ao exportar Nmap XML: {e}", "ERRO")
+
+    if getattr(args, "html_output", None) and todos_resultados:
+        try:
+            gerar_html(todos_resultados, args.html_output)
+        except Exception as e:
+            _log(f"Erro ao gerar HTML: {e}", "ERRO")
 
     print(f"\n  {C['G']}{C['N']}[+] Ghost-Scan finalizado.{C['X']}\n")
 
