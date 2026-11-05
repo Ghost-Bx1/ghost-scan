@@ -86,8 +86,9 @@ def _build_banner():
         f"{D}{hl}{X}",
         f"{W}By Gh0st-Bx1  {D}{bar}  github.com/Ghost-Bx1{X}",
         f"{D}{hl}{X}",
-        f"{D}--target --ports --rate --banner --udp{X}",
-        f"{D}--os-detect --cidr --nmap-xml --json{X}",
+        f"{D}--target --ports --rate --banner --udp --passive{X}",
+        f"{D}--os-detect --cidr --nmap-xml --http-fp --ssl{X}",
+        f"{D}-T0-T5 --exclude-cdn --ipv6 --json --html-output{X}",
     ]
 
     out = [f"{G}{TL}{eq}{TR}{X}", f"{G}{VB}{sp}{VB}{X}"]
@@ -511,8 +512,24 @@ def http_fingerprint(host, porta, timeout=5, ssl_ctx=None):
         if sig.lower() in body.lower():
             techs.append(nome)
 
+    # Favicon hash (MurmurHash3-inspired: simple 32-bit XOR rotate for fingerprinting)
+    favicon_fp = None
+    try:
+        fav_url = f"{esquema}://{host}:{porta}/favicon.ico"
+        fav_req = urllib.request.Request(fav_url, headers={"User-Agent": ua})
+        with urllib.request.urlopen(fav_req, timeout=timeout, context=ctx) as fr:
+            fav_data = fr.read(65536)
+        if fav_data:
+            h = 0x9747b28c
+            for b in fav_data:
+                h ^= b; h = ((h << 5) | (h >> 27)) & 0xFFFFFFFF; h ^= (h >> 16)
+            favicon_fp = h if h <= 0x7FFFFFFF else h - 0x100000000
+    except Exception:
+        pass
+
     return {"url": url, "titulo": titulo, "server": server, "techs": techs,
-            "status": headers.get("status", ""), "x-powered-by": powered}
+            "status": headers.get("status", ""), "x-powered-by": powered,
+            "favicon_hash": favicon_fp}
 
 
 def fingerprint_portas_web(host, portas_abertas, timeout=5, verbose=False):
@@ -829,6 +846,15 @@ def main():
                         help="Salvar relatorio HTML")
     parser.add_argument("--no-banner", action="store_true",
                         help="Sem banner inicial")
+    parser.add_argument("-T", metavar="N", type=int, choices=range(6), default=None,
+                        dest="timing",
+                        help="Template de timing: 0=paranoid 1=sneaky 2=polite 3=normal 4=agressivo 5=insano")
+    parser.add_argument("--passive", action="store_true",
+                        help="Enriquecimento passivo via Shodan InternetDB (sem varredura ativa)")
+    parser.add_argument("--exclude-cdn", action="store_true", dest="exclude_cdn",
+                        help="Excluir IPs de CDN conhecidos (Cloudflare, Akamai, Fastly, etc.)")
+    parser.add_argument("--jsonl", metavar="FILE",
+                        help="Saida JSON Lines (streaming, um resultado por linha)")
 
     args = parser.parse_args()
 
@@ -844,6 +870,20 @@ def main():
     if args.proxy:
         _PROXY = args.proxy
         _log(f"Proxy: {_PROXY}", "INFO")
+
+    # Timing templates T0-T5
+    _TIMING = {
+        0: (5.0, 50,  "paranoid:  timeout=5.0s rate=50"),
+        1: (3.0, 150, "sneaky:    timeout=3.0s rate=150"),
+        2: (2.0, 300, "polite:    timeout=2.0s rate=300"),
+        3: (1.0, 1000,"normal:    timeout=1.0s rate=1000"),
+        4: (0.5, 2000,"agressivo: timeout=0.5s rate=2000"),
+        5: (0.2, 5000,"insano:    timeout=0.2s rate=5000"),
+    }
+    if args.timing is not None:
+        t, r, lbl = _TIMING[args.timing]
+        args.timeout = t; args.rate = r
+        _log(f"Timing T{args.timing} ({lbl})", "INFO")
 
     # Fast mode overrides
     if args.fast:
@@ -875,10 +915,40 @@ def main():
                 _log("Formato de portas invalido. Use: 80,443,8080", "ERRO")
                 sys.exit(1)
 
+    # CDN IP ranges (CIDRs of major CDN ASNs - static known ranges)
+    _CDN_CIDRS = [
+        # Cloudflare
+        "103.21.244.0/22","103.22.200.0/22","103.31.4.0/22","104.16.0.0/13",
+        "104.24.0.0/14","108.162.192.0/18","131.0.72.0/22","141.101.64.0/18",
+        "162.158.0.0/15","172.64.0.0/13","173.245.48.0/20","188.114.96.0/20",
+        "190.93.240.0/20","197.234.240.0/22","198.41.128.0/17",
+        # Fastly
+        "23.235.32.0/20","23.253.0.0/18","199.27.72.0/21","199.232.0.0/16",
+        "151.101.0.0/16",
+        # Akamai (sample ranges)
+        "23.32.0.0/11","23.64.0.0/14","104.64.0.0/10",
+    ]
+
+    def _is_cdn_ip(ip):
+        try:
+            addr = ipaddress.ip_address(ip)
+            for cidr in _CDN_CIDRS:
+                if addr in ipaddress.ip_network(cidr, strict=False):
+                    return True
+        except Exception:
+            pass
+        return False
+
     # Coletar alvos
     alvos_raw = []
     if args.target:
-        alvos_raw.append(args.target)
+        if args.target == "-":
+            for line in sys.stdin:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    alvos_raw.append(line)
+        else:
+            alvos_raw.append(args.target)
     if args.targets_file:
         try:
             with open(args.targets_file) as f:
@@ -896,6 +966,15 @@ def main():
         hosts.extend(expandir_cidr(alvo))
 
     hosts = list(dict.fromkeys(hosts))  # deduplica mantendo ordem
+
+    # CDN exclusion
+    if getattr(args, "exclude_cdn", False):
+        antes = len(hosts)
+        hosts = [h for h in hosts if not _is_cdn_ip(h)]
+        excl = antes - len(hosts)
+        if excl:
+            _log(f"CDN exclusion: {excl} IP(s) removido(s)", "INFO")
+
     if not hosts:
         _log("Nenhum host para escanear", "ERRO")
         sys.exit(1)
@@ -906,20 +985,48 @@ def main():
     if args.udp:
         _log("UDP scan habilitado", "INFO")
 
-    todos_resultados = []
-    if len(hosts) == 1:
-        r = scan_host(hosts[0], portas, args)
-        if r:
-            todos_resultados.append(r)
+    # Passive mode: Shodan InternetDB only, no active scan
+    if getattr(args, "passive", False):
+        _log("Modo passivo: Shodan InternetDB (sem varredura ativa)", "INFO")
+        todos_resultados = []
+        for host in hosts:
+            try:
+                ip = socket.gethostbyname(host)
+            except Exception:
+                ip = host
+            req = urllib.request.Request(
+                f"https://internetdb.shodan.io/{ip}",
+                headers={"User-Agent": "GhostScan/2.0"}
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = json.loads(resp.read())
+                ports = [{"porta": p, "servico": SERVICOS.get(p, "unknown")} for p in data.get("ports", [])]
+                cves = list(data.get("vulns", []))
+                r = {"ip": ip, "hostname": host, "portas_tcp": ports, "cves": cves,
+                     "hostnames": data.get("hostnames", []), "tags": data.get("tags", []),
+                     "cpes": data.get("cpes", []), "fonte": "shodan-internetdb"}
+                todos_resultados.append(r)
+                _log(f"{ip}: {len(ports)} ports, {len(cves)} CVEs", "OK" if ports else "INFO")
+                if cves:
+                    _log(f"CVEs: {', '.join(cves[:5])}", "ALERTA")
+            except Exception as e:
+                _log(f"{host}: {e}", "ERRO")
     else:
-        _log(f"Scan em massa: {len(hosts)} hosts, {args.threads} threads", "INFO")
-        with ThreadPoolExecutor(max_workers=args.threads) as pool:
-            futures = {pool.submit(scan_host, h, portas, args): h for h in hosts}
-            from concurrent.futures import as_completed
-            for fut in as_completed(futures):
-                r = fut.result()
-                if r:
-                    todos_resultados.append(r)
+        todos_resultados = []
+        if len(hosts) == 1:
+            r = scan_host(hosts[0], portas, args)
+            if r:
+                todos_resultados.append(r)
+        else:
+            _log(f"Scan em massa: {len(hosts)} hosts, {args.threads} threads", "INFO")
+            with ThreadPoolExecutor(max_workers=args.threads) as pool:
+                futures = {pool.submit(scan_host, h, portas, args): h for h in hosts}
+                from concurrent.futures import as_completed
+                for fut in as_completed(futures):
+                    r = fut.result()
+                    if r:
+                        todos_resultados.append(r)
 
     # Resumo
     _secao("RESUMO FINAL")
@@ -951,6 +1058,16 @@ def main():
                               args.nmap_xml)
         except Exception as e:
             _log(f"Erro ao exportar Nmap XML: {e}", "ERRO")
+
+    # JSONL streaming output
+    if getattr(args, "jsonl", None) and todos_resultados:
+        try:
+            with open(args.jsonl, "w") as f:
+                for r in todos_resultados:
+                    f.write(json.dumps(r, default=str) + "\n")
+            _log(f"JSONL salvo: {args.jsonl}", "OK")
+        except Exception as e:
+            _log(f"Erro ao salvar JSONL: {e}", "ERRO")
 
     if getattr(args, "html_output", None) and todos_resultados:
         try:
