@@ -106,6 +106,25 @@ When a banner is captured, Ghost-Scan checks it against a built-in database of k
 
 ---
 
+## Roadmap
+
+Improvements planned based on analysis of rustscan, masscan and naabu:
+
+| Priority | Feature | Description |
+|----------|---------|-------------|
+| High | Shodan InternetDB passive mode | Pull known open ports from `api.internetdb.shodan.io` without touching the host (`--passive`) |
+| High | Pipeline/stdin mode | Read targets from stdin (`echo 10.0.0.1 \| ghost-scan`); pipe results to other tools |
+| High | Scripting engine | Trigger a module per open port: smb-enum on 445, http-titles on 80/443, redis-info on 6379 |
+| High | HTTP title + favicon grabber | On ports 80/443/8080: grab `<title>` and status code without running full HTTP module |
+| Medium | JSON lines streaming output | Emit each result as it arrives (compatible with `jq` piping), not buffered at the end |
+| Medium | SYN scan mode | Raw socket SYN scan (`--syn`, requires root/admin) - faster than full connect |
+| Medium | Timing templates T0-T5 | Preset profiles that adjust rate + timeout together: paranoid (T0) to insane (T5) |
+| Medium | ASN input | `--asn AS14421` expands to all prefixes via BGP data and scans them |
+| Medium | Exclude CDN ranges | Built-in CIDR list for Cloudflare/Akamai/Incapsula/Sucuri to skip or flag (`--exclude-cdn`) |
+| Low | Distributed sharding | `--shard 1/3` to divide a large range across multiple instances running in parallel |
+| Low | SSL certificate inspection | Per-port TLS: expiry date, issuer, SANs, weak cipher detection on discovered HTTPS services |
+| Low | Service confidence scoring | Weight banner match confidence (0-100) based on number of matched patterns per service |
+
 ## Disclaimer
 
 For use in authorized environments only. Penetration testing, CTF competitions, and offensive security research with explicit permission from the environment owner. The author is not responsible for misuse.
