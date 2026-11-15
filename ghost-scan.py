@@ -801,11 +801,52 @@ td{{padding:5px 10px;border-bottom:1px solid #21262d;font-size:12px;}}
 # CLI / main
 # ──────────────────────────────────────────────────────────────────
 
+_SCAN_HELP = """\033[92mOpcoes de Scan:\033[0m
+  \033[1m-t / --target\033[0m      Alvo: hostname, IP ou CIDR (ex: 192.168.1.0/24)
+  \033[1m--targets-file\033[0m     Arquivo com alvos (um por linha)
+  \033[1m-p / --ports\033[0m       Portas (ex: 22,80,443 ou 1-1024 ou top100)
+  \033[1m--rate\033[0m N            Pacotes por segundo (padrao: 1000)
+  \033[1m--timeout\033[0m N         Timeout por porta em segundos (padrao: 1.0)
+  \033[1m--threads\033[0m N         Threads paralelas (padrao: 10)
+  \033[1m--fast\033[0m             Modo rapido - top 100 portas, timeout reduzido
+
+\033[92mDeteccao:\033[0m
+  \033[1m--banner\033[0m           Captura banner dos servicos abertos
+  \033[1m--udp\033[0m              Scan UDP (requer root)
+  \033[1m--os-detect\033[0m        Deteccao de OS via TTL e fingerprint
+  \033[1m--http-fp\033[0m          Fingerprint HTTP em portas web detectadas
+  \033[1m--ssl\033[0m              Analise de certificado SSL/TLS
+  \033[1m--passive\033[0m          Modo passivo - sem SYN raw, apenas connect()
+  \033[1m--exclude-cdn\033[0m      Pular IPs de CDN (Cloudflare, Akamai, Fastly)
+  \033[1m-T N\033[0m               Timing: 0=paranoid 1=sneaky 2=polite 3=normal 4=agg 5=insane
+
+\033[92mRede e Output:\033[0m
+  \033[1m--ipv6\033[0m             Scan IPv6
+  \033[1m--proxy\033[0m            Proxy HTTP/HTTPS (ex: http://127.0.0.1:8080)
+  \033[1m--output\033[0m           Salvar resultados em JSON
+  \033[1m--nmap-xml\033[0m         Importar/exportar formato XML do nmap
+  \033[1m--html-output\033[0m      Salvar relatorio em HTML
+  \033[1m--jsonl\033[0m            Salvar em formato JSONL (uma linha por host)
+  \033[1m--verbose\033[0m          Saida detalhada
+  \033[1m--no-banner\033[0m        Suprimir banner
+
+\033[92mExemplos:\033[0m
+  python ghost-scan.py -t 192.168.1.1 --banner --http-fp
+  python ghost-scan.py -t 192.168.1.0/24 -p 22,80,443,3389 --threads 50
+  python ghost-scan.py -t exemplo.com -p 1-65535 --fast --output resultado.json
+  python ghost-scan.py --targets-file alvos.txt -p top100 --ssl --os-detect
+  python ghost-scan.py -t 10.0.0.0/8 --rate 5000 -T 4 --jsonl saida.jsonl
+
+\033[2mUse: python ghost-scan.py --help  para ver todos os flags disponiveis\033[0m
+"""
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="ghost-scan",
-        description=f"Ghost-Scan v{VERSAO} - Async Port Scanner | By Gh0st-Bx1",
-        formatter_class=argparse.RawTextHelpFormatter,
+        description=f"Ghost-Scan v{VERSAO} - Async Port Scanner  |  By Gh0st-Bx1",
+        epilog=_SCAN_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
     parser.add_argument("-t", "--target", default=None,
