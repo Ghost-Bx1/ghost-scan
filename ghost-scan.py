@@ -1100,6 +1100,243 @@ def vuln_scan_exposed_files(base_url, timeout=8, verbose=False):
     return achados
 
 
+def vuln_scan_waf(base_url, timeout=8, verbose=False):
+    """Detecta presenca de WAF via fingerprint de headers e respostas a payloads."""
+    achados = []
+    WAF_HEADERS = {
+        "server": {
+            "cloudflare": "Cloudflare", "sucuri": "Sucuri", "mod_security": "ModSecurity",
+            "akamai": "Akamai", "imperva": "Imperva", "f5 big-ip": "F5 BIG-IP",
+            "barracuda": "Barracuda", "fastly": "Fastly",
+        },
+        "x-powered-by": {"imperva": "Imperva"},
+        "x-sucuri-id": {"sucuri": "Sucuri"},
+        "cf-ray": {"cloudflare": "Cloudflare"},
+        "x-waf-event-info": {"barracuda": "Barracuda"},
+        "x-akamai-transformed": {"akamai": "Akamai"},
+        "x-fw-block-reason": {"fortiweb": "FortiWeb"},
+    }
+    WAF_PAYLOADS = [
+        "?q=<script>alert(1)</script>",
+        "?id=1' OR '1'='1",
+        "?file=../../../etc/passwd",
+    ]
+    detected = set()
+    try:
+        # Probe 1: normal request - check headers
+        status, headers, body = _http(base_url, timeout=timeout)
+        for hdr_name, patterns in WAF_HEADERS.items():
+            hdr_val = headers.get(hdr_name, "").lower()
+            for sig, waf_name in patterns.items():
+                if sig in hdr_val:
+                    detected.add(waf_name)
+
+        # Probe 2: inject attack payloads and look for WAF block pages
+        for path in WAF_PAYLOADS:
+            try:
+                st, hdrs, bd = _http(base_url.rstrip("/") + path, timeout=timeout)
+                body_s = bd.decode(errors="replace").lower()
+                # Common WAF block signatures
+                if any(sig in body_s for sig in ["access denied", "request blocked",
+                        "security check", "waf", "malicious", "forbidden by policy",
+                        "attack detected", "mod_security", "sucuri cloudproxy"]):
+                    detected.add("WAF (generic block page)")
+                # HTTP 403/406/419/429 from WAF
+                if st in (403, 406, 419, 429) and not detected:
+                    detected.add("WAF (suspicious HTTP status)")
+                for hdr_name, patterns in WAF_HEADERS.items():
+                    hdr_val = hdrs.get(hdr_name, "").lower()
+                    for sig, waf_name in patterns.items():
+                        if sig in hdr_val:
+                            detected.add(waf_name)
+            except Exception:
+                pass
+
+        if detected:
+            for waf in detected:
+                _log(f"WAF detectado: {waf} em {base_url}", "ALERTA")
+                achados.append({
+                    "tipo": "waf", "severidade": "INFO",
+                    "url": base_url, "detalhe": f"WAF: {waf}",
+                    "evidencia": waf,
+                })
+        else:
+            if verbose:
+                _log(f"Nenhum WAF detectado em {base_url}", "INFO")
+    except Exception as e:
+        if verbose:
+            _log(f"Erro WAF scan: {e}", "ERRO")
+    return achados
+
+
+def vuln_scan_cors(base_url, timeout=8, verbose=False):
+    """Detecta misconfiguracao CORS (Access-Control-Allow-Origin: *)."""
+    achados = []
+    EVIL_ORIGINS = [
+        "https://evil.com",
+        "null",
+        "https://attacker.com",
+        f"{base_url.rstrip('/')}.evil.com",
+    ]
+    for origin in EVIL_ORIGINS:
+        try:
+            hdrs = {"Origin": origin}
+            status, resp_headers, body = _http(base_url, headers=hdrs, timeout=timeout)
+            acao = resp_headers.get("access-control-allow-origin", "")
+            acac = resp_headers.get("access-control-allow-credentials", "")
+            if acao == "*":
+                _log(f"CORS wildcard: {base_url} - ACAO: *", "ALERTA")
+                achados.append({
+                    "tipo": "cors", "severidade": "MEDIO",
+                    "url": base_url, "detalhe": "CORS wildcard - ACAO: *",
+                    "evidencia": "Access-Control-Allow-Origin: *",
+                })
+                break
+            if origin in acao:
+                sev = "CRITICO" if acac.lower() == "true" else "ALTO"
+                _log(f"CORS reflected origin: {base_url} - Origem refletida, credentials={acac}", sev)
+                achados.append({
+                    "tipo": "cors", "severidade": sev,
+                    "url": base_url,
+                    "detalhe": f"CORS reflete origem arbitraria - credentials={acac}",
+                    "evidencia": f"ACAO: {acao} | ACAC: {acac}",
+                })
+                break
+            if "null" in acao:
+                _log(f"CORS null origin aceito: {base_url}", "ALTO")
+                achados.append({
+                    "tipo": "cors", "severidade": "ALTO",
+                    "url": base_url, "detalhe": "CORS aceita 'null' origin (iframe sandbox bypass)",
+                    "evidencia": f"ACAO: {acao}",
+                })
+                break
+        except Exception:
+            pass
+    return achados
+
+
+def vuln_scan_graphql(base_url, timeout=8, verbose=False):
+    """Detecta endpoint GraphQL exposto e testa introspection."""
+    achados = []
+    GRAPHQL_PATHS = [
+        "/graphql", "/api/graphql", "/graphql/v1", "/v1/graphql",
+        "/query", "/api", "/gql", "/graphiql", "/playground",
+    ]
+    INTROSPECTION_QUERY = '{"query":"{__schema{types{name}}}"}'
+    for path in GRAPHQL_PATHS:
+        url = base_url.rstrip("/") + path
+        try:
+            status, headers, body = _http(
+                url, method="POST", body=INTROSPECTION_QUERY.encode(),
+                headers={"Content-Type": "application/json"}, timeout=timeout,
+            )
+            body_s = body.decode(errors="replace")
+            if '"__schema"' in body_s or '"types"' in body_s:
+                _log(f"GraphQL introspection exposta: {url}", "CRITICO")
+                schema_preview = body_s[:200].replace("\n", " ")
+                achados.append({
+                    "tipo": "graphql_introspection", "severidade": "ALTO",
+                    "url": url, "detalhe": "GraphQL introspection habilitada - schema vazado",
+                    "evidencia": schema_preview,
+                })
+                break
+            if '"data"' in body_s or '"errors"' in body_s:
+                _log(f"Endpoint GraphQL encontrado: {url}", "ALERTA")
+                achados.append({
+                    "tipo": "graphql_found", "severidade": "INFO",
+                    "url": url, "detalhe": "Endpoint GraphQL detectado (introspection desabilitada)",
+                    "evidencia": body_s[:100],
+                })
+                break
+            # Check GET-based introspection
+            get_url = url + "?query={__schema{types{name}}}"
+            st2, _, bd2 = _http(get_url, timeout=timeout)
+            bd2_s = bd2.decode(errors="replace")
+            if '"__schema"' in bd2_s:
+                _log(f"GraphQL introspection via GET: {get_url}", "CRITICO")
+                achados.append({
+                    "tipo": "graphql_introspection", "severidade": "ALTO",
+                    "url": get_url, "detalhe": "GraphQL introspection via GET",
+                    "evidencia": bd2_s[:200],
+                })
+                break
+        except Exception:
+            pass
+    return achados
+
+
+def vuln_scan_cms(base_url, timeout=8, verbose=False):
+    """Detecta CMS (WordPress, Joomla, Drupal, Magento) e versions expostas."""
+    achados = []
+    CMS_FINGERPRINTS = [
+        ("WordPress", [
+            ("/wp-login.php", "user_login", None),
+            ("/wp-json/wp/v2/users", '"slug"', None),
+            ("/readme.html", "WordPress", None),
+            ("/wp-content/", None, None),
+        ]),
+        ("Joomla", [
+            ("/administrator/", "Joomla", None),
+            ("/components/", None, None),
+            ("/templates/", None, None),
+            ("/media/jui/", None, None),
+        ]),
+        ("Drupal", [
+            ("/user/login", "Drupal", None),
+            ("/core/CHANGELOG.txt", "Drupal", None),
+            ("/sites/default/", None, None),
+        ]),
+        ("Magento", [
+            ("/skin/frontend/", None, None),
+            ("/downloader/", "Magento", None),
+            ("/app/etc/", None, None),
+        ]),
+        ("Laravel", [
+            ("/laravel-websockets", None, None),
+            ("", "laravel_session", "set-cookie"),
+        ]),
+        ("Struts", [
+            ("/.action", None, None),
+            ("/.do", None, None),
+        ]),
+    ]
+    for cms_name, probes in CMS_FINGERPRINTS:
+        for path, keyword, header_name in probes:
+            try:
+                url = base_url.rstrip("/") + path
+                status, headers, body = _http(url, timeout=timeout)
+                body_s = body.decode(errors="replace").lower()
+                if status in (200, 301, 302, 403):
+                    matched = False
+                    if keyword and keyword.lower() in body_s:
+                        matched = True
+                    elif header_name and keyword and keyword.lower() in headers.get(header_name, "").lower():
+                        matched = True
+                    elif not keyword and status in (200, 403):
+                        matched = True
+                    if matched:
+                        _log(f"CMS detectado: {cms_name} em {base_url} [{url}]", "ALERTA")
+                        # Try version detection for WordPress
+                        version = ""
+                        if cms_name == "WordPress":
+                            import re as _re
+                            m = _re.search(r'<meta name="generator" content="WordPress ([0-9.]+)"', body.decode(errors="replace"))
+                            if m:
+                                version = m.group(1)
+                        achados.append({
+                            "tipo": "cms_detected", "severidade": "MEDIO",
+                            "url": url, "cms": cms_name,
+                            "detalhe": f"CMS: {cms_name}" + (f" v{version}" if version else ""),
+                            "evidencia": url,
+                        })
+                        break
+            except Exception:
+                pass
+        if any(a.get("cms") == cms_name for a in achados):
+            break  # Found this CMS, no need for more probes
+    return achados
+
+
 def vuln_scan_http(host, portas_abertas, timeout=8, verbose=False):
     """Orquestra todos os checks de vuln web em um host."""
     _secao("WEB VULNERABILITY SCAN")
@@ -1118,6 +1355,10 @@ def vuln_scan_http(host, portas_abertas, timeout=8, verbose=False):
         if verbose and params:
             _log(f"Parametros encontrados: {params}", "INFO")
 
+        todos_achados += vuln_scan_waf(base_url, timeout=timeout, verbose=verbose)
+        todos_achados += vuln_scan_cors(base_url, timeout=timeout, verbose=verbose)
+        todos_achados += vuln_scan_cms(base_url, timeout=timeout, verbose=verbose)
+        todos_achados += vuln_scan_graphql(base_url, timeout=timeout, verbose=verbose)
         todos_achados += vuln_scan_exposed_files(base_url, timeout=timeout, verbose=verbose)
         todos_achados += vuln_scan_sqli(base_url, params, timeout=timeout, verbose=verbose)
         todos_achados += vuln_scan_lfi(base_url, params, timeout=timeout, verbose=verbose)
@@ -1153,7 +1394,7 @@ _SCAN_HELP = """\033[92mOpcoes de Scan:\033[0m
   \033[1m--passive\033[0m          Modo passivo - sem SYN raw, apenas connect()
   \033[1m--exclude-cdn\033[0m      Pular IPs de CDN (Cloudflare, Akamai, Fastly)
   \033[1m-T N\033[0m               Timing: 0=paranoid 1=sneaky 2=polite 3=normal 4=agg 5=insane
-  \033[1m--vuln\033[0m             Web vuln scan: SQLi, LFI, XSS, SSRF, auth bypass, exposed files
+  \033[1m--vuln\033[0m             Web vuln scan: WAF, CORS, CMS, GraphQL, SQLi, LFI, XSS, SSRF, auth bypass
 
 \033[92mRede e Output:\033[0m
   \033[1m--ipv6\033[0m             Scan IPv6
